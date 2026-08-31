@@ -1,0 +1,37 @@
+{
+  "name": "poke-device-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:device": "tsx scripts/test-device.ts"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^11.3.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "better-sqlite3": "^12.0.0",
+    "fastify": "^5.0.0",
+    "pino": "^9.0.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.5.0",
+    "eslint": "^9.0.0",
+    "globals": "^16.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^6.0.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^3.0.0"
+  }
+}
