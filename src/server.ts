@@ -20,7 +20,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
   const { config, storage, poke, sessions } = deps;
   const app = Fastify({
     logger: { level: config.LOG_LEVEL, redact: ['req.headers.authorization'] },
-    trustProxy: true,
+    trustProxy: config.TRUST_PROXY,
     bodyLimit: 128 * 1024,
     // Query-token WebSocket auth exists only for old Android clients. Avoid logging URLs containing it.
     disableRequestLogging: true
@@ -30,6 +30,9 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
   const allowlist = pokeUserAllowlist(config);
   const limiter = new FixedWindowRateLimiter();
   const expectedPublicHost = new URL(config.PUBLIC_BASE_URL).hostname;
+  const pruneTimer = setInterval(() => limiter.prune(), 5 * 60_000);
+  pruneTimer.unref();
+  app.addHook('onClose', async () => { clearInterval(pruneTimer); });
 
   const authDevice = (request: FastifyRequest): Device | null => {
     const token = bearer(request.headers.authorization);
