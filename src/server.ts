@@ -9,6 +9,7 @@ import type { Storage, Device } from './storage.js';
 import type { PokeClient } from './poke.js';
 import type { SessionManager } from './sessions.js';
 import { createMcpNodeHandler } from './mcp.js';
+import { FixedWindowRateLimiter } from './rate-limit.js';
 
 function bearer(header: string | undefined): string | null {
   if (!header?.startsWith('Bearer ')) return null;
@@ -27,16 +28,19 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
   await app.register(websocket, { options: { perMessageDeflate: false, maxPayload: 64 * 1024 } });
   const mcpNode = createMcpNodeHandler(storage, sessions);
   const allowlist = pokeUserAllowlist(config);
+  const limiter = new FixedWindowRateLimiter();
+  const expectedPublicHost = new URL(config.PUBLIC_BASE_URL).hostname;
 
   const authDevice = (request: FastifyRequest): Device | null => {
     const token = bearer(request.headers.authorization);
     return token ? storage.authenticateDevice(token) : null;
   };
 
-  app.get('/health', async () => ({ status: 'ok', uptime: process.uptime(), connectedDevices: sessions.count() }));
-  app.get('/ready', async () => ({ status: 'ready' }));
+  app.get('/health', async () => ({ status: 'ok', uptime: process.uptime(), connectedDevices: sessions.count(), database: storage.ping() ? 'ok' : 'error' }));
+  app.get('/ready', async (_request, reply) => storage.ping() ? { status: 'ready' } : reply.code(503).send({ status: 'not_ready' }));
 
   app.post('/api/v1/enroll', async (request, reply) => {
+    if (!limiter.allow(`enroll:${request.ip}`, 10, 10 * 60_000)) return reply.code(429).send({ error: 'rate_limited' });
     const token = bearer(request.headers.authorization);
     if (!token || !constantTimeEqual(token, config.DEVICE_ENROLLMENT_SECRET)) return reply.code(401).send({ error: 'unauthorized' });
     const body = request.body as { name?: unknown; clientDeviceId?: unknown };
@@ -62,11 +66,18 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
 
   const submit = async (device: Device, text: string): Promise<string> => {
     if (text.length > config.MAX_MESSAGE_LENGTH) throw new Error('message_too_long');
+    if (!limiter.allow(`chat:${device.id}`, 30, 60_000)) throw new Error('rate_limited');
     const requestId = storage.createRequest(device.id, text);
     try {
       await poke.sendDeviceMessage({ deviceId: device.id, requestId, text });
       storage.markRequestAccepted(requestId);
       sessions.sendTransient(device.id, 'chat.accepted', { requestId });
+      const timeout = setTimeout(() => {
+        if (storage.expireAcceptedRequest(requestId)) {
+          sessions.sendTransient(device.id, 'error', { requestId, code: 'POKE_REPLY_TIMEOUT', message: 'Poke accepted the request but did not return a device reply in time.' });
+        }
+      }, config.POKE_REPLY_TIMEOUT_MS);
+      timeout.unref();
       return requestId;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown_error';
@@ -84,7 +95,8 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     try {
       const requestId = await submit(device, parsed.data.text);
       return reply.code(202).send({ accepted: true, requestId });
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.message === 'rate_limited') return reply.code(429).send({ accepted: false, error: 'rate_limited' });
       return reply.code(502).send({ accepted: false, error: 'poke_api_error' });
     }
   });
@@ -119,14 +131,17 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     const device = token ? storage.authenticateDevice(token) : null;
     if (!device) { socket.close(1008, 'unauthorized'); return; }
     sessions.attach(device.id, socket);
-    socket.on('message', async data => {
+    socket.on('message', data => {
       try {
         const json = JSON.parse(data.toString());
         const envelope = clientEnvelopeSchema.parse(json);
         if (envelope.type === 'chat.send') {
           const payload = chatSendSchema.parse(envelope.payload);
           if (payload.text.length > config.MAX_MESSAGE_LENGTH) throw new Error('message_too_long');
-          void submit(device, payload.text).catch(() => undefined);
+          void submit(device, payload.text).catch(error => {
+            const code = error instanceof Error && error.message === 'rate_limited' ? 'RATE_LIMITED' : 'REQUEST_FAILED';
+            sessions.sendTransient(device.id, 'error', { code, message: code === 'RATE_LIMITED' ? 'Too many messages.' : 'Request failed.' });
+          });
         } else if (envelope.type === 'ack') {
           const payload = ackSchema.parse(envelope.payload);
           storage.acknowledge(device.id, payload.messageId);
@@ -144,10 +159,20 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
   });
 
   app.all('/mcp', async (request, reply) => {
+    if (config.NODE_ENV === 'production' && request.hostname !== expectedPublicHost) return reply.code(403).send({ error: 'invalid_host' });
+    const origin = request.headers.origin;
+    if (origin) {
+      try {
+        if (new URL(origin).hostname !== expectedPublicHost) return reply.code(403).send({ error: 'invalid_origin' });
+      } catch {
+        return reply.code(403).send({ error: 'invalid_origin' });
+      }
+    }
     const token = bearer(request.headers.authorization);
     if (!token || !constantTimeEqual(token, config.MCP_SHARED_SECRET)) return reply.code(401).send({ error: 'unauthorized' });
     const pokeUserId = request.headers['x-poke-user-id'];
     if (allowlist.size > 0 && (typeof pokeUserId !== 'string' || !allowlist.has(pokeUserId))) return reply.code(403).send({ error: 'poke_user_not_allowed' });
+    if (!limiter.allow(`mcp:${typeof pokeUserId === 'string' ? pokeUserId : 'unknown'}`, 120, 60_000)) return reply.code(429).send({ error: 'rate_limited' });
     reply.hijack();
     await mcpNode(request.raw, reply.raw, request.body);
   });
