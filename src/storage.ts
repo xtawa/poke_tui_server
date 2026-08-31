@@ -15,6 +15,7 @@ export class Storage {
     this.db = new DatabaseDriver(config.DATABASE_PATH);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
+    this.db.pragma('busy_timeout = 5000');
     this.migrate();
   }
 
@@ -68,6 +69,11 @@ export class Storage {
     `);
   }
 
+  ping(): boolean {
+    const row = this.db.prepare('SELECT 1 AS ok').get() as { ok: number } | undefined;
+    return row?.ok === 1;
+  }
+
   enrollDevice(name: string, token: string, clientDeviceId?: string): Device {
     const id = ids.device();
     const now = Date.now();
@@ -104,6 +110,10 @@ export class Storage {
   markRequestAccepted(id: string): void { this.db.prepare("UPDATE requests SET status='accepted', poke_accepted_at=? WHERE id=?").run(Date.now(), id); }
   markRequestCompleted(id: string): void { this.db.prepare("UPDATE requests SET status='completed', completed_at=? WHERE id=?").run(Date.now(), id); }
   markRequestError(id: string, error: string): void { this.db.prepare("UPDATE requests SET status='error', error=? WHERE id=?").run(error.slice(0, 1000), id); }
+  expireAcceptedRequest(id: string): boolean {
+    const result = this.db.prepare("UPDATE requests SET status='reply_timeout', error='Poke reply timeout' WHERE id=? AND status='accepted'").run(id);
+    return result.changes > 0;
+  }
 
   queueOutbound(deviceId: string, requestId: string | null, type: string, payload: unknown): OutboundMessage {
     const payloadText = JSON.stringify(payload);
@@ -111,6 +121,11 @@ export class Storage {
     const existing = this.db.prepare('SELECT * FROM outbound_messages WHERE device_id=? AND request_id IS ? AND type=? AND payload_hash=?')
       .get(deviceId, requestId, type, payloadHash) as any;
     if (existing) return this.mapOutbound(existing);
+
+    const pending = this.db.prepare('SELECT COUNT(*) AS count FROM outbound_messages WHERE device_id=? AND acknowledged_at IS NULL')
+      .get(deviceId) as { count: number };
+    if (pending.count >= this.config.DEVICE_OFFLINE_QUEUE_LIMIT) throw new Error('device_outbound_queue_full');
+
     const id = ids.message();
     const createdAt = Date.now();
     this.db.prepare('INSERT INTO outbound_messages(id,device_id,request_id,type,payload,payload_hash,created_at) VALUES(?,?,?,?,?,?,?)')
@@ -118,7 +133,7 @@ export class Storage {
     return { id, deviceId, requestId, type, payload: payloadText, createdAt, sentAt: null, acknowledgedAt: null };
   }
 
-  pendingOutbound(deviceId: string, limit = 100): OutboundMessage[] {
+  pendingOutbound(deviceId: string, limit = this.config.DEVICE_OFFLINE_QUEUE_LIMIT): OutboundMessage[] {
     return (this.db.prepare('SELECT * FROM outbound_messages WHERE device_id=? AND acknowledged_at IS NULL ORDER BY created_at ASC LIMIT ?')
       .all(deviceId, limit) as any[]).map(row => this.mapOutbound(row));
   }
@@ -132,7 +147,14 @@ export class Storage {
   updateStatus(deviceId: string, status: Record<string, unknown>): void {
     this.db.prepare(`INSERT INTO device_status(device_id,battery,charging,screen_on,wifi_rssi,app_version,android_version,updated_at)
       VALUES(@deviceId,@battery,@charging,@screenOn,@wifiRssi,@appVersion,@androidVersion,@updatedAt)
-      ON CONFLICT(device_id) DO UPDATE SET battery=excluded.battery,charging=excluded.charging,screen_on=excluded.screen_on,wifi_rssi=excluded.wifi_rssi,app_version=excluded.app_version,android_version=excluded.android_version,updated_at=excluded.updated_at`)
+      ON CONFLICT(device_id) DO UPDATE SET
+        battery=COALESCE(excluded.battery,device_status.battery),
+        charging=COALESCE(excluded.charging,device_status.charging),
+        screen_on=COALESCE(excluded.screen_on,device_status.screen_on),
+        wifi_rssi=COALESCE(excluded.wifi_rssi,device_status.wifi_rssi),
+        app_version=COALESCE(excluded.app_version,device_status.app_version),
+        android_version=COALESCE(excluded.android_version,device_status.android_version),
+        updated_at=excluded.updated_at`)
       .run({ deviceId, battery: status.battery ?? null, charging: status.charging == null ? null : Number(status.charging), screenOn: status.screenOn == null ? null : Number(status.screenOn), wifiRssi: status.wifiRssi ?? null, appVersion: status.appVersion ?? null, androidVersion: status.androidVersion ?? null, updatedAt: Date.now() });
   }
 
