@@ -32,7 +32,12 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
   const expectedPublicHost = new URL(config.PUBLIC_BASE_URL).hostname;
   const pruneTimer = setInterval(() => limiter.prune(), 5 * 60_000);
   pruneTimer.unref();
-  app.addHook('onClose', async () => { clearInterval(pruneTimer); });
+  const replyTimeouts = new Set<NodeJS.Timeout>();
+  app.addHook('onClose', async () => {
+    clearInterval(pruneTimer);
+    for (const timer of replyTimeouts) clearTimeout(timer);
+    replyTimeouts.clear();
+  });
 
   const authDevice = (request: FastifyRequest): Device | null => {
     const token = bearer(request.headers.authorization);
@@ -86,11 +91,13 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
       storage.markRequestAccepted(requestId);
       sessions.sendTransient(device.id, 'chat.accepted', { requestId });
       const timeout = setTimeout(() => {
+        replyTimeouts.delete(timeout);
         if (storage.expireAcceptedRequest(requestId)) {
           sessions.sendTransient(device.id, 'error', { requestId, code: 'POKE_REPLY_TIMEOUT', message: 'Poke accepted the request but did not return a device reply in time.' });
         }
       }, config.POKE_REPLY_TIMEOUT_MS);
       timeout.unref();
+      replyTimeouts.add(timeout);
       return requestId;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown_error';
@@ -173,7 +180,9 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
           });
         } else if (envelope.type === 'ack') {
           const payload = ackSchema.parse(envelope.payload);
-          storage.acknowledge(device.id, payload.messageId);
+          if (!storage.acknowledge(device.id, payload.messageId)) {
+            sessions.sendTransient(device.id, 'error', { code: 'MESSAGE_NOT_FOUND', message: 'Unknown message ID for this device.', messageId: payload.messageId });
+          }
         } else if (envelope.type === 'device.status') {
           const payload = deviceStatusSchema.parse(envelope.payload);
           storage.updateStatus(device.id, payload);
