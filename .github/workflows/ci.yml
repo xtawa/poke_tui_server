@@ -20,9 +20,10 @@ jobs:
       - run: npm run build
       - name: Build production Docker image
         run: docker build -t poke-device-bridge:ci .
-      - name: Smoke test production container
+      - name: Smoke test production container and MCP
         shell: bash
         run: |
+          set -euo pipefail
           docker run -d --name poke-bridge-ci -p 127.0.0.1:3000:3000 \
             -e NODE_ENV=production \
             -e PUBLIC_BASE_URL=http://localhost:3000 \
@@ -30,12 +31,25 @@ jobs:
             -e MCP_SHARED_SECRET=ci-mcp-shared-secret-0000000000000000 \
             -e DEVICE_ENROLLMENT_SECRET=ci-enrollment-secret-0000000000000000 \
             -e DATABASE_PATH=/data/poke.db \
+            -e TRUST_PROXY=false \
             poke-device-bridge:ci
           trap 'docker logs poke-bridge-ci || true; docker rm -f poke-bridge-ci || true' EXIT
+
+          healthy=false
           for i in {1..30}; do
             if curl --fail --silent http://127.0.0.1:3000/health | grep -q '"status":"ok"'; then
-              exit 0
+              healthy=true
+              break
             fi
             sleep 1
           done
-          exit 1
+          test "$healthy" = true
+
+          curl --fail --silent --show-error \
+            -X POST http://127.0.0.1:3000/mcp \
+            -H 'Host: localhost' \
+            -H 'Authorization: Bearer ci-mcp-shared-secret-0000000000000000' \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+            | grep -q 'reply_to_device'
