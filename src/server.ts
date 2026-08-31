@@ -126,8 +126,10 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
   });
 
   app.get('/ws', { websocket: true }, (socket: WebSocket, request) => {
-    const query = request.query as { token?: string };
-    const token = bearer(request.headers.authorization) ?? query.token ?? null;
+    const query = request.query as { token?: unknown };
+    const headerToken = bearer(request.headers.authorization);
+    const queryToken = typeof query.token === 'string' && query.token.length <= 256 ? query.token : null;
+    const token = headerToken ?? queryToken;
     const device = token ? storage.authenticateDevice(token) : null;
     if (!device) { socket.close(1008, 'unauthorized'); return; }
     sessions.attach(device.id, socket);
