@@ -26,7 +26,7 @@ ws.on('message', raw => {
       id: `client_${randomUUID()}`,
       type: 'chat.send',
       timestamp: Date.now(),
-      payload: { text: 'Reply with exactly POKE_DEVICE_BRIDGE_OK. Then use reply_to_device as instructed by the bridge.' }
+      payload: { text: 'Reply with exactly: POKE_DEVICE_BRIDGE_OK' }
     }));
   }
   if (msg.type === 'chat.message') {
