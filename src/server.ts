@@ -3,7 +3,7 @@ import websocket from '@fastify/websocket';
 import type WebSocket from 'ws';
 import type { Config } from './config.js';
 import { pokeUserAllowlist } from './config.js';
-import { constantTimeEqual, newToken } from './crypto.js';
+import { constantTimeEqual, hashText, newToken } from './crypto.js';
 import { ackSchema, chatSendSchema, clientEnvelopeSchema, deviceStatusSchema } from './protocol.js';
 import type { Storage, Device } from './storage.js';
 import type { PokeClient } from './poke.js';
@@ -67,10 +67,20 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     return reply.code(204).send();
   });
 
-  const submit = async (device: Device, text: string): Promise<string> => {
+  const submit = async (device: Device, text: string, clientMessageId?: string): Promise<string> => {
     if (text.length > config.MAX_MESSAGE_LENGTH) throw new Error('message_too_long');
+
+    if (clientMessageId) {
+      const existing = storage.findRequestByClientMessage(device.id, clientMessageId);
+      if (existing) {
+        if (existing.textHash !== hashText(text)) throw new Error('idempotency_conflict');
+        sessions.sendTransient(device.id, 'chat.accepted', { requestId: existing.requestId, duplicate: true });
+        return existing.requestId;
+      }
+    }
+
     if (!limiter.allow(`chat:${device.id}`, 30, 60_000)) throw new Error('rate_limited');
-    const requestId = storage.createRequest(device.id, text);
+    const requestId = storage.createRequest(device.id, text, clientMessageId);
     try {
       await poke.sendDeviceMessage({ deviceId: device.id, requestId, text });
       storage.markRequestAccepted(requestId);
@@ -95,11 +105,16 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     if (!device) return reply.code(401).send({ error: 'unauthorized' });
     const parsed = chatSendSchema.safeParse(request.body);
     if (!parsed.success || parsed.data.text.length > config.MAX_MESSAGE_LENGTH) return reply.code(400).send({ error: 'invalid_message' });
+    const rawIdempotencyKey = request.headers['idempotency-key'];
+    if (rawIdempotencyKey !== undefined && (typeof rawIdempotencyKey !== 'string' || rawIdempotencyKey.length < 1 || rawIdempotencyKey.length > 128)) {
+      return reply.code(400).send({ error: 'invalid_idempotency_key' });
+    }
     try {
-      const requestId = await submit(device, parsed.data.text);
+      const requestId = await submit(device, parsed.data.text, rawIdempotencyKey);
       return reply.code(202).send({ accepted: true, requestId });
     } catch (error) {
       if (error instanceof Error && error.message === 'rate_limited') return reply.code(429).send({ accepted: false, error: 'rate_limited' });
+      if (error instanceof Error && error.message === 'idempotency_conflict') return reply.code(409).send({ accepted: false, error: 'idempotency_conflict' });
       return reply.code(502).send({ accepted: false, error: 'poke_api_error' });
     }
   });
@@ -143,9 +158,18 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
         if (envelope.type === 'chat.send') {
           const payload = chatSendSchema.parse(envelope.payload);
           if (payload.text.length > config.MAX_MESSAGE_LENGTH) throw new Error('message_too_long');
-          void submit(device, payload.text).catch(error => {
-            const code = error instanceof Error && error.message === 'rate_limited' ? 'RATE_LIMITED' : 'REQUEST_FAILED';
-            sessions.sendTransient(device.id, 'error', { code, message: code === 'RATE_LIMITED' ? 'Too many messages.' : 'Request failed.' });
+          void submit(device, payload.text, envelope.id).catch(error => {
+            const code = error instanceof Error && error.message === 'rate_limited'
+              ? 'RATE_LIMITED'
+              : error instanceof Error && error.message === 'idempotency_conflict'
+                ? 'IDEMPOTENCY_CONFLICT'
+                : 'REQUEST_FAILED';
+            const message = code === 'RATE_LIMITED'
+              ? 'Too many messages.'
+              : code === 'IDEMPOTENCY_CONFLICT'
+                ? 'The same message ID was reused with different content.'
+                : 'Request failed.';
+            sessions.sendTransient(device.id, 'error', { clientMessageId: envelope.id, code, message });
           });
         } else if (envelope.type === 'ack') {
           const payload = ackSchema.parse(envelope.payload);
