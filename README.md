@@ -24,18 +24,19 @@ The outbound Poke API confirms delivery only. The final answer returns through t
 - MCP tools: `reply_to_device`, `notify_device`, `get_device_status`
 - device enrollment, hashed device tokens and revocation
 - WebSocket connection, heartbeat, replacement and reconnect replay
+- persisted inbound idempotency so a retried device message cannot invoke Poke twice
 - HTTP polling fallback for Android 6 devices
 - SQLite WAL persistence and bounded offline queue
 - reply timeout handling
 - device and MCP rate limiting
 - Docker, Compose, Caddy, Nginx and systemd deployment files
-- CI typecheck, lint, tests, build and production-container smoke test
+- CI typecheck, lint, tests, build, production-container health and MCP tool-discovery smoke tests
 
 ## Configuration
 
 Copy `.env.example` to `.env` and set the public HTTPS base URL plus the three independent credentials used for Poke outbound access, MCP inbound access and device enrollment.
 
-By default the server does not persist full inbound user text. Set `STORE_MESSAGE_CONTENT=true` only if message retention is desired.
+By default the server does not persist full inbound user text. Set `STORE_MESSAGE_CONTENT=true` only if message retention is desired. Inbound deduplication stores only the client message ID, request ID and existing request text hash, so it still works when full message retention is disabled.
 
 For Docker, SQLite is stored under the mounted `data` directory.
 
@@ -66,6 +67,8 @@ Device-originated messages are sent to Poke with server-generated `deviceId` and
 
 The preferred WebSocket authentication method is an Authorization header. A query-token compatibility mode exists for old Android WebSocket clients; application request logging is disabled so that compatibility token is not written to request logs.
 
+For HTTP sending, clients may supply an `Idempotency-Key` header (1-128 characters). Reusing that key with the same text returns the original request ID without calling Poke again; reusing it with different text returns HTTP 409.
+
 ## WebSocket protocol
 
 Device messages use a common envelope with `id`, `type`, `timestamp` and `payload`.
@@ -86,6 +89,8 @@ Server -> device types:
 - `error`
 - `pong`
 
+The WebSocket envelope `id` is the persisted idempotency key for `chat.send`. If the same message is retransmitted after a network interruption, the bridge returns the original `requestId` instead of executing Poke a second time. Reusing the ID with different message text is rejected as an idempotency conflict.
+
 A `chat.message` remains in SQLite until the device ACKs its message ID. On reconnect, unacknowledged messages are replayed.
 
 ## Development verification
@@ -93,6 +98,8 @@ A `chat.message` remains in SQLite until the device ACKs its message ID. On reco
 Run the normal npm install step, then `npm run typecheck`, `npm run lint`, `npm test`, and `npm run build`.
 
 `scripts/test-device.ts` is a simulated Android client. With a real enrolled device token and a configured Poke Remote MCP integration, `npm run test:device` performs the full end-to-end check and expects the final text `POKE_DEVICE_BRIDGE_OK` to arrive through `reply_to_device`.
+
+CI also builds the production Docker image, starts it, checks `/health`, authenticates to `/mcp`, and verifies that `reply_to_device` is actually discoverable at runtime.
 
 CI does not contain real Poke credentials, so live Poke E2E remains a manual deployment test.
 
