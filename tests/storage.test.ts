@@ -50,6 +50,27 @@ describe('Storage', () => {
     }
   });
 
+  it('deduplicates retried request replies but allows identical proactive notifications', () => {
+    const storage = createStorage();
+    try {
+      const device = storage.enrollDevice('notifications', 'notifications-token');
+      const requestId = storage.createRequest(device.id, 'hello');
+      const replyPayload = { requestId, text: 'same reply' };
+      const firstReply = storage.queueOutbound(device.id, requestId, 'chat.message', replyPayload);
+      const retriedReply = storage.queueOutbound(device.id, requestId, 'chat.message', replyPayload);
+      expect(retriedReply.id).toBe(firstReply.id);
+
+      const notificationPayload = { title: 'Build', body: 'Finished', priority: 'normal' };
+      const firstNotification = storage.queueOutbound(device.id, null, 'notification', notificationPayload);
+      expect(storage.acknowledge(device.id, firstNotification.id)).toBe(true);
+      const secondNotification = storage.queueOutbound(device.id, null, 'notification', notificationPayload);
+      expect(secondNotification.id).not.toBe(firstNotification.id);
+      expect(storage.pendingOutbound(device.id).map(item => item.id)).toContain(secondNotification.id);
+    } finally {
+      storage.close();
+    }
+  });
+
   it('preserves previously reported status fields on partial updates', () => {
     const storage = createStorage();
     try {
