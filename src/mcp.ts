@@ -27,10 +27,15 @@ export function createMcpNodeHandler(storage: Storage, sessions: SessionManager)
       const device = storage.getDevice(deviceId);
       if (!device || device.revokedAt) return { content: [{ type: 'text', text: 'Unknown or revoked device.' }], isError: true };
       if (!storage.requestBelongsTo(requestId, deviceId)) return { content: [{ type: 'text', text: 'requestId does not belong to deviceId.' }], isError: true };
-      const outbound = storage.queueOutbound(deviceId, requestId, 'chat.message', { requestId, text, title: title ?? null, actions: actions ?? [] });
-      storage.markRequestCompleted(requestId);
-      sessions.deliver(outbound);
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, messageId: outbound.id, delivered: sessions.isOnline(deviceId) }) }] };
+      try {
+        const outbound = storage.queueOutbound(deviceId, requestId, 'chat.message', { requestId, text, title: title ?? null, actions: actions ?? [] });
+        storage.markRequestCompleted(requestId);
+        const delivered = sessions.deliver(outbound);
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, messageId: outbound.id, delivered, queued: !delivered }) }] };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'queue_error';
+        return { content: [{ type: 'text', text: `Could not queue device reply: ${message}` }], isError: true };
+      }
     });
 
     server.registerTool('notify_device', {
@@ -44,9 +49,14 @@ export function createMcpNodeHandler(storage: Storage, sessions: SessionManager)
     }, async ({ deviceId, title, body, priority }) => {
       const device = storage.getDevice(deviceId);
       if (!device || device.revokedAt) return { content: [{ type: 'text', text: 'Unknown or revoked device.' }], isError: true };
-      const outbound = storage.queueOutbound(deviceId, null, 'notification', { title, body, priority });
-      sessions.deliver(outbound);
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, messageId: outbound.id, delivered: sessions.isOnline(deviceId) }) }] };
+      try {
+        const outbound = storage.queueOutbound(deviceId, null, 'notification', { title, body, priority });
+        const delivered = sessions.deliver(outbound);
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, messageId: outbound.id, delivered, queued: !delivered }) }] };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'queue_error';
+        return { content: [{ type: 'text', text: `Could not queue notification: ${message}` }], isError: true };
+      }
     });
 
     server.registerTool('get_device_status', {
