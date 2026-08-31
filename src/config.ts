@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+const boolString = z.string().default('false').transform(v => v === 'true');
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   HOST: z.string().default('0.0.0.0'),
@@ -15,7 +17,8 @@ const envSchema = z.object({
   POKE_REPLY_TIMEOUT_MS: z.coerce.number().int().min(10000).default(180000),
   DEVICE_OFFLINE_QUEUE_LIMIT: z.coerce.number().int().min(10).max(10000).default(100),
   POKE_USER_ID_ALLOWLIST: z.string().default(''),
-  STORE_MESSAGE_CONTENT: z.string().default('false').transform(v => v === 'true')
+  STORE_MESSAGE_CONTENT: boolString,
+  TRUST_PROXY: z.string().default('true').transform(v => v === 'true')
 });
 
 export type Config = z.infer<typeof envSchema>;
