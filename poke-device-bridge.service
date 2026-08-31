@@ -1,0 +1,22 @@
+[Unit]
+Description=Poke Device Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=poke
+Group=poke
+WorkingDirectory=/opt/poke-device-bridge
+EnvironmentFile=/etc/poke-device-bridge.env
+ExecStart=/usr/bin/node /opt/poke-device-bridge/dist/src/index.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/poke-device-bridge
+
+[Install]
+WantedBy=multi-user.target
