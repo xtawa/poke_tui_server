@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ['feat/poke-device-bridge']
+    branches: ['main', 'feat/poke-device-bridge', 'test/poke-real-e2e']
   pull_request:
 
 concurrency:
