@@ -3,7 +3,7 @@ import websocket from '@fastify/websocket';
 import type WebSocket from 'ws';
 import type { Config } from './config.js';
 import { pokeUserAllowlist } from './config.js';
-import { constantTimeEqual, ids, newToken } from './crypto.js';
+import { constantTimeEqual, newToken } from './crypto.js';
 import { ackSchema, chatSendSchema, clientEnvelopeSchema, deviceStatusSchema } from './protocol.js';
 import type { Storage, Device } from './storage.js';
 import type { PokeClient } from './poke.js';
@@ -17,7 +17,13 @@ function bearer(header: string | undefined): string | null {
 
 export async function buildServer(deps: { config: Config; storage: Storage; poke: PokeClient; sessions: SessionManager }): Promise<FastifyInstance> {
   const { config, storage, poke, sessions } = deps;
-  const app = Fastify({ logger: { level: config.LOG_LEVEL }, trustProxy: true, bodyLimit: 128 * 1024 });
+  const app = Fastify({
+    logger: { level: config.LOG_LEVEL, redact: ['req.headers.authorization'] },
+    trustProxy: true,
+    bodyLimit: 128 * 1024,
+    // Query-token WebSocket auth exists only for old Android clients. Avoid logging URLs containing it.
+    disableRequestLogging: true
+  });
   await app.register(websocket, { options: { perMessageDeflate: false, maxPayload: 64 * 1024 } });
   const mcpNode = createMcpNodeHandler(storage, sessions);
   const allowlist = pokeUserAllowlist(config);
@@ -27,7 +33,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     return token ? storage.authenticateDevice(token) : null;
   };
 
-  app.get('/health', async () => ({ status: 'ok', uptime: process.uptime(), connectedDevices: undefined }));
+  app.get('/health', async () => ({ status: 'ok', uptime: process.uptime(), connectedDevices: sessions.count() }));
   app.get('/ready', async () => ({ status: 'ready' }));
 
   app.post('/api/v1/enroll', async (request, reply) => {
@@ -50,6 +56,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     const device = authDevice(request);
     if (!device) return reply.code(401).send({ error: 'unauthorized' });
     storage.revokeDevice(device.id);
+    sessions.disconnect(device.id);
     return reply.code(204).send();
   });
 
@@ -86,6 +93,14 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     const device = authDevice(request);
     if (!device) return reply.code(401).send({ error: 'unauthorized' });
     return { messages: storage.pendingOutbound(device.id).map(m => ({ id: m.id, type: m.type, timestamp: m.createdAt, payload: JSON.parse(m.payload) })) };
+  });
+
+  app.post('/api/v1/messages/:messageId/ack', async (request, reply) => {
+    const device = authDevice(request);
+    if (!device) return reply.code(401).send({ error: 'unauthorized' });
+    const { messageId } = request.params as { messageId: string };
+    if (!storage.acknowledge(device.id, messageId)) return reply.code(404).send({ error: 'message_not_found' });
+    return reply.code(204).send();
   });
 
   app.post('/api/v1/device/status', async (request, reply) => {
