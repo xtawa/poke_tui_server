@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
+import { hashText } from '../src/crypto.js';
 import { Storage } from '../src/storage.js';
 
 const cleanup: string[] = [];
@@ -45,6 +46,25 @@ describe('Storage', () => {
       expect(storage.acknowledge(second.id, outbound.id)).toBe(false);
       expect(storage.acknowledge(first.id, outbound.id)).toBe(true);
       expect(storage.pendingOutbound(first.id)).toHaveLength(0);
+    } finally {
+      storage.close();
+    }
+  });
+
+  it('persists device-scoped inbound idempotency keys and their payload hash', () => {
+    const storage = createStorage();
+    try {
+      const first = storage.enrollDevice('first-idem', 'token-first-idem');
+      const second = storage.enrollDevice('second-idem', 'token-second-idem');
+      const requestId = storage.createRequest(first.id, 'perform one action', 'client-message-1');
+      expect(storage.findRequestByClientMessage(first.id, 'client-message-1')).toEqual({
+        requestId,
+        textHash: hashText('perform one action')
+      });
+      expect(storage.findRequestByClientMessage(second.id, 'client-message-1')).toBeNull();
+
+      const secondRequest = storage.createRequest(second.id, 'other device action', 'client-message-1');
+      expect(storage.findRequestByClientMessage(second.id, 'client-message-1')?.requestId).toBe(secondRequest);
     } finally {
       storage.close();
     }
