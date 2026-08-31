@@ -18,3 +18,24 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+      - name: Build production Docker image
+        run: docker build -t poke-device-bridge:ci .
+      - name: Smoke test production container
+        shell: bash
+        run: |
+          docker run -d --name poke-bridge-ci -p 127.0.0.1:3000:3000 \
+            -e NODE_ENV=production \
+            -e PUBLIC_BASE_URL=http://localhost:3000 \
+            -e POKE_API_KEY=ci-poke-api-key-placeholder \
+            -e MCP_SHARED_SECRET=ci-mcp-shared-secret-0000000000000000 \
+            -e DEVICE_ENROLLMENT_SECRET=ci-enrollment-secret-0000000000000000 \
+            -e DATABASE_PATH=/data/poke.db \
+            poke-device-bridge:ci
+          trap 'docker logs poke-bridge-ci || true; docker rm -f poke-bridge-ci || true' EXIT
+          for i in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:3000/health | grep -q '"status":"ok"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
