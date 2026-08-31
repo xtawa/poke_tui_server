@@ -1,4 +1,4 @@
-import type WebSocket from 'ws';
+import WebSocket from 'ws';
 import type { Config } from './config.js';
 import type { Storage, OutboundMessage } from './storage.js';
 import { ids } from './crypto.js';
@@ -38,6 +38,15 @@ export class SessionManager {
     this.sessions.clear();
   }
 
+  count(): number { return this.sessions.size; }
+
+  disconnect(deviceId: string, code = 4003, reason = 'device revoked'): void {
+    const session = this.sessions.get(deviceId);
+    if (!session) return;
+    this.sessions.delete(deviceId);
+    session.socket.close(code, reason);
+  }
+
   attach(deviceId: string, socket: WebSocket): void {
     const previous = this.sessions.get(deviceId);
     if (previous && previous.socket !== socket) previous.socket.close(4001, 'session replaced');
@@ -61,12 +70,12 @@ export class SessionManager {
 
   isOnline(deviceId: string): boolean {
     const socket = this.sessions.get(deviceId)?.socket;
-    return !!socket && socket.readyState === socket.OPEN;
+    return !!socket && socket.readyState === WebSocket.OPEN;
   }
 
   deliver(outbound: OutboundMessage): boolean {
     const session = this.sessions.get(outbound.deviceId);
-    if (!session || session.socket.readyState !== session.socket.OPEN) return false;
+    if (!session || session.socket.readyState !== WebSocket.OPEN) return false;
     const envelope: ServerEnvelope = {
       id: outbound.id,
       type: outbound.type as ServerEnvelope['type'],
@@ -84,12 +93,12 @@ export class SessionManager {
 
   sendTransient(deviceId: string, type: ServerEnvelope['type'], payload: unknown): boolean {
     const session = this.sessions.get(deviceId);
-    if (!session || session.socket.readyState !== session.socket.OPEN) return false;
+    if (!session || session.socket.readyState !== WebSocket.OPEN) return false;
     this.sendEnvelope(session.socket, { id: ids.message(), type, timestamp: Date.now(), payload });
     return true;
   }
 
   private sendEnvelope(socket: WebSocket, envelope: ServerEnvelope): void {
-    if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(envelope));
+    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(envelope));
   }
 }
