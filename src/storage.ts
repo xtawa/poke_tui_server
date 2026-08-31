@@ -7,6 +7,7 @@ import type { Config } from './config.js';
 export type Device = { id: string; name: string; createdAt: number; lastSeenAt: number | null; revokedAt: number | null };
 export type DeviceStatus = { online?: boolean; battery: number | null; charging: boolean | null; screenOn: boolean | null; wifiRssi: number | null; appVersion: string | null; androidVersion: string | null; updatedAt: number | null };
 export type OutboundMessage = { id: string; deviceId: string; requestId: string | null; type: string; payload: string; createdAt: number; sentAt: number | null; acknowledgedAt: number | null };
+export type InboundRequestIdentity = { requestId: string; textHash: string };
 
 export class Storage {
   private readonly db: DatabaseDriver.Database;
@@ -103,10 +104,13 @@ export class Storage {
   touchDevice(id: string): void { this.db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(Date.now(), id); }
   revokeDevice(id: string): void { this.db.prepare('UPDATE devices SET revoked_at=? WHERE id=?').run(Date.now(), id); }
 
-  findRequestByClientMessage(deviceId: string, clientMessageId: string): string | null {
-    const row = this.db.prepare('SELECT request_id FROM inbound_dedupe WHERE device_id=? AND client_message_id=?')
-      .get(deviceId, clientMessageId) as { request_id: string } | undefined;
-    return row?.request_id ?? null;
+  findRequestByClientMessage(deviceId: string, clientMessageId: string): InboundRequestIdentity | null {
+    const row = this.db.prepare(`SELECT d.request_id, r.user_text_hash
+      FROM inbound_dedupe d
+      JOIN requests r ON r.id=d.request_id
+      WHERE d.device_id=? AND d.client_message_id=?`)
+      .get(deviceId, clientMessageId) as { request_id: string; user_text_hash: string } | undefined;
+    return row ? { requestId: row.request_id, textHash: row.user_text_hash } : null;
   }
 
   createRequest(deviceId: string, text: string, clientMessageId?: string): string {
