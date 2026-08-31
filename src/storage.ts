@@ -43,6 +43,13 @@ export class Storage {
         error TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_requests_device_created ON requests(device_id, created_at DESC);
+      CREATE TABLE IF NOT EXISTS inbound_dedupe (
+        device_id TEXT NOT NULL REFERENCES devices(id),
+        client_message_id TEXT NOT NULL,
+        request_id TEXT NOT NULL UNIQUE REFERENCES requests(id),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(device_id, client_message_id)
+      );
       CREATE TABLE IF NOT EXISTS outbound_messages (
         id TEXT PRIMARY KEY,
         device_id TEXT NOT NULL REFERENCES devices(id),
@@ -96,10 +103,24 @@ export class Storage {
   touchDevice(id: string): void { this.db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(Date.now(), id); }
   revokeDevice(id: string): void { this.db.prepare('UPDATE devices SET revoked_at=? WHERE id=?').run(Date.now(), id); }
 
-  createRequest(deviceId: string, text: string): string {
+  findRequestByClientMessage(deviceId: string, clientMessageId: string): string | null {
+    const row = this.db.prepare('SELECT request_id FROM inbound_dedupe WHERE device_id=? AND client_message_id=?')
+      .get(deviceId, clientMessageId) as { request_id: string } | undefined;
+    return row?.request_id ?? null;
+  }
+
+  createRequest(deviceId: string, text: string, clientMessageId?: string): string {
     const id = ids.request();
-    this.db.prepare(`INSERT INTO requests(id,device_id,user_text,user_text_hash,user_text_length,status,created_at) VALUES(?,?,?,?,?,?,?)`)
-      .run(id, deviceId, this.config.STORE_MESSAGE_CONTENT ? text : null, hashText(text), text.length, 'pending', Date.now());
+    const now = Date.now();
+    const insert = this.db.transaction(() => {
+      this.db.prepare(`INSERT INTO requests(id,device_id,user_text,user_text_hash,user_text_length,status,created_at) VALUES(?,?,?,?,?,?,?)`)
+        .run(id, deviceId, this.config.STORE_MESSAGE_CONTENT ? text : null, hashText(text), text.length, 'pending', now);
+      if (clientMessageId) {
+        this.db.prepare('INSERT INTO inbound_dedupe(device_id,client_message_id,request_id,created_at) VALUES(?,?,?,?)')
+          .run(deviceId, clientMessageId, id, now);
+      }
+    });
+    insert();
     return id;
   }
 
