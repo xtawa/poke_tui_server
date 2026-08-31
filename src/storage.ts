@@ -118,9 +118,15 @@ export class Storage {
   queueOutbound(deviceId: string, requestId: string | null, type: string, payload: unknown): OutboundMessage {
     const payloadText = JSON.stringify(payload);
     const payloadHash = hashText(payloadText);
-    const existing = this.db.prepare('SELECT * FROM outbound_messages WHERE device_id=? AND request_id IS ? AND type=? AND payload_hash=?')
-      .get(deviceId, requestId, type, payloadHash) as any;
-    if (existing) return this.mapOutbound(existing);
+
+    // Poke may retry a reply tool call, so request-bound replies are idempotent.
+    // Proactive notifications have no requestId and must remain repeatable even when
+    // title/body are identical to an earlier notification.
+    if (requestId !== null) {
+      const existing = this.db.prepare('SELECT * FROM outbound_messages WHERE device_id=? AND request_id=? AND type=? AND payload_hash=?')
+        .get(deviceId, requestId, type, payloadHash) as any;
+      if (existing) return this.mapOutbound(existing);
+    }
 
     const pending = this.db.prepare('SELECT COUNT(*) AS count FROM outbound_messages WHERE device_id=? AND acknowledged_at IS NULL')
       .get(deviceId) as { count: number };
