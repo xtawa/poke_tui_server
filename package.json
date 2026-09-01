@@ -11,7 +11,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:device": "tsx scripts/test-device.ts"
+    "test:device": "tsx scripts/test-device.ts",
+    "test:real-e2e": "tsx scripts/test-real-e2e.ts"
   },
   "dependencies": {
     "@fastify/websocket": "^11.3.0",
