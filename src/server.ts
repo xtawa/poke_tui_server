@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
+import Fastify, { LogController, type FastifyInstance, type FastifyRequest } from 'fastify';
 import websocket from '@fastify/websocket';
 import type WebSocket from 'ws';
 import type { Config } from './config.js';
@@ -26,10 +26,9 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
   const { config, storage, poke, sessions } = deps;
   const app = Fastify({
     logger: { level: config.LOG_LEVEL, redact: ['req.headers.authorization'] },
+    logController: new LogController({ disableRequestLogging: true }),
     trustProxy: config.TRUST_PROXY,
-    bodyLimit: 128 * 1024,
-    // Query-token WebSocket auth is opt-in for legacy Android clients. Avoid logging URLs containing it.
-    disableRequestLogging: true
+    bodyLimit: 128 * 1024
   });
   await app.register(websocket, { options: { perMessageDeflate: false, maxPayload: 64 * 1024 } });
   const mcpNode = createMcpNodeHandler(storage, sessions, event => app.log.info(event, event.event));
