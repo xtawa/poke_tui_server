@@ -48,6 +48,13 @@ In Poke/Kitchen add this server as a Remote MCP integration using:
 - authentication: Bearer/API-key authentication
 - key: the same value configured as `MCP_SHARED_SECRET`
 
+The current Poke CLI can also add the remote MCP after login:
+
+```bash
+npx poke@latest login
+npx poke@latest mcp add https://YOUR_DOMAIN/mcp -n "Poke Device Bridge" -k "$MCP_SHARED_SECRET"
+```
+
 After tool sync, Poke should discover `reply_to_device`, `notify_device` and `get_device_status`.
 
 Device-originated messages are sent to Poke with server-generated `deviceId` and `requestId` routing metadata. Poke is explicitly instructed to call `reply_to_device` after completing the request. The MCP tool verifies that the request belongs to the specified device before delivering it.
@@ -65,7 +72,7 @@ Device-originated messages are sent to Poke with server-generated `deviceId` and
 - `POST/GET /mcp` - Poke Remote MCP endpoint
 - `GET /health` and `GET /ready` - service probes
 
-The preferred WebSocket authentication method is an Authorization header. A query-token compatibility mode exists for old Android WebSocket clients; application request logging is disabled so that compatibility token is not written to request logs.
+The preferred WebSocket authentication method is an `Authorization: Bearer ...` header. Query-string token authentication is disabled by default because reverse-proxy access logs can capture URLs. Only set `ALLOW_WS_QUERY_TOKEN=true` for a legacy Android WebSocket client that cannot send an Authorization header; application request logging remains disabled as an additional safeguard.
 
 For HTTP sending, clients may supply an `Idempotency-Key` header (1-128 characters). Reusing that key with the same text returns the original request ID without calling Poke again; reusing it with different text returns HTTP 409.
 
@@ -97,11 +104,26 @@ A `chat.message` remains in SQLite until the device ACKs its message ID. On reco
 
 Run the normal npm install step, then `npm run typecheck`, `npm run lint`, `npm test`, and `npm run build`.
 
-`scripts/test-device.ts` is a simulated Android client. With a real enrolled device token and a configured Poke Remote MCP integration, `npm run test:device` performs the full end-to-end check and expects the final text `POKE_DEVICE_BRIDGE_OK` to arrive through `reply_to_device`.
+`scripts/test-device.ts` is a simulated Android client. With a real enrolled device token and a configured Poke Remote MCP integration, `npm run test:device` performs the end-to-end check and expects the final text `POKE_DEVICE_BRIDGE_OK` to arrive through `reply_to_device`.
+
+For a deployed server, `scripts/test-real-e2e.ts` performs the complete acceptance flow itself: health/ready, temporary device enrollment, authenticated WSS connection, Poke request, Remote MCP reply, ACK persistence, test-device revocation and revoked-token rejection.
+
+```bash
+SERVER_URL=https://YOUR_DOMAIN \
+DEVICE_ENROLLMENT_SECRET="$DEVICE_ENROLLMENT_SECRET" \
+npm run test:real-e2e
+```
+
+Optional variables:
+
+- `E2E_EXPECTED_TEXT` (default `POKE_DEVICE_BRIDGE_OK`)
+- `E2E_TIMEOUT_MS` (default `240000`)
+
+A successful run ends with `REAL POKE E2E PASS`. It requires the deployed bridge to already have a real `POKE_API_KEY` and the Poke account to have the bridge Remote MCP integration configured.
 
 CI also builds the production Docker image, starts it, checks `/health`, authenticates to `/mcp`, and verifies that `reply_to_device` is actually discoverable at runtime.
 
-CI does not contain real Poke credentials, so live Poke E2E remains a manual deployment test.
+CI does not contain real Poke credentials, so live Poke E2E remains a deployment test rather than a public-repository CI step.
 
 ## Deployment
 
