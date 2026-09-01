@@ -16,6 +16,12 @@ function bearer(header: string | undefined): string | null {
   return header.slice(7).trim() || null;
 }
 
+function mcpMethod(body: unknown): string | undefined {
+  if (!body || typeof body !== 'object' || !('method' in body)) return undefined;
+  const method = (body as { method?: unknown }).method;
+  return typeof method === 'string' ? method.slice(0, 128) : undefined;
+}
+
 export async function buildServer(deps: { config: Config; storage: Storage; poke: PokeClient; sessions: SessionManager }): Promise<FastifyInstance> {
   const { config, storage, poke, sessions } = deps;
   const app = Fastify({
@@ -26,7 +32,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     disableRequestLogging: true
   });
   await app.register(websocket, { options: { perMessageDeflate: false, maxPayload: 64 * 1024 } });
-  const mcpNode = createMcpNodeHandler(storage, sessions);
+  const mcpNode = createMcpNodeHandler(storage, sessions, event => app.log.info(event, event.event));
   const allowlist = pokeUserAllowlist(config);
   const limiter = new FixedWindowRateLimiter();
   const expectedPublicHost = new URL(config.PUBLIC_BASE_URL).hostname;
@@ -55,6 +61,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     if (typeof body?.name !== 'string' || body.name.length < 1 || body.name.length > 128) return reply.code(400).send({ error: 'invalid_name' });
     const deviceToken = newToken();
     const device = storage.enrollDevice(body.name, deviceToken, typeof body.clientDeviceId === 'string' ? body.clientDeviceId.slice(0, 256) : undefined);
+    app.log.info({ event: 'device_enrolled', deviceId: device.id }, 'device_enrolled');
     return reply.code(201).send({ deviceId: device.id, deviceToken, websocketUrl: `${config.PUBLIC_BASE_URL.replace(/^http/, 'ws')}/ws`, apiBaseUrl: `${config.PUBLIC_BASE_URL}/api/v1` });
   });
 
@@ -69,6 +76,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     if (!device) return reply.code(401).send({ error: 'unauthorized' });
     storage.revokeDevice(device.id);
     sessions.disconnect(device.id);
+    app.log.info({ event: 'device_revoked', deviceId: device.id }, 'device_revoked');
     return reply.code(204).send();
   });
 
@@ -79,6 +87,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
       const existing = storage.findRequestByClientMessage(device.id, clientMessageId);
       if (existing) {
         if (existing.textHash !== hashText(text)) throw new Error('idempotency_conflict');
+        app.log.info({ event: 'chat_request_duplicate', deviceId: device.id, requestId: existing.requestId }, 'chat_request_duplicate');
         sessions.sendTransient(device.id, 'chat.accepted', { requestId: existing.requestId, duplicate: true });
         return existing.requestId;
       }
@@ -86,13 +95,17 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
 
     if (!limiter.allow(`chat:${device.id}`, 30, 60_000)) throw new Error('rate_limited');
     const requestId = storage.createRequest(device.id, text, clientMessageId);
+    app.log.info({ event: 'chat_request_received', deviceId: device.id, requestId, textLength: text.length }, 'chat_request_received');
     try {
+      app.log.info({ event: 'poke_api_request', deviceId: device.id, requestId }, 'poke_api_request');
       await poke.sendDeviceMessage({ deviceId: device.id, requestId, text });
       storage.markRequestAccepted(requestId);
+      app.log.info({ event: 'poke_api_accepted', deviceId: device.id, requestId }, 'poke_api_accepted');
       sessions.sendTransient(device.id, 'chat.accepted', { requestId });
       const timeout = setTimeout(() => {
         replyTimeouts.delete(timeout);
         if (storage.expireAcceptedRequest(requestId)) {
+          app.log.warn({ event: 'request_reply_timeout', deviceId: device.id, requestId }, 'request_reply_timeout');
           sessions.sendTransient(device.id, 'error', { requestId, code: 'POKE_REPLY_TIMEOUT', message: 'Poke accepted the request but did not return a device reply in time.' });
         }
       }, config.POKE_REPLY_TIMEOUT_MS);
@@ -102,6 +115,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown_error';
       storage.markRequestError(requestId, message);
+      app.log.warn({ event: 'poke_api_failed', deviceId: device.id, requestId }, 'poke_api_failed');
       sessions.sendTransient(device.id, 'error', { requestId, code: 'POKE_API_ERROR', message: 'Poke did not accept the request.' });
       throw error;
     }
@@ -137,6 +151,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     if (!device) return reply.code(401).send({ error: 'unauthorized' });
     const { messageId } = request.params as { messageId: string };
     if (!storage.acknowledge(device.id, messageId)) return reply.code(404).send({ error: 'message_not_found' });
+    app.log.info({ event: 'message_acknowledged', deviceId: device.id, messageId, transport: 'http' }, 'message_acknowledged');
     return reply.code(204).send();
   });
 
@@ -156,8 +171,14 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     const queryToken = config.ALLOW_WS_QUERY_TOKEN && typeof query.token === 'string' && query.token.length <= 256 ? query.token : null;
     const token = headerToken ?? queryToken;
     const device = token ? storage.authenticateDevice(token) : null;
-    if (!device) { socket.close(1008, 'unauthorized'); return; }
+    if (!device) {
+      app.log.warn({ event: 'device_ws_auth_failed', ip: request.ip }, 'device_ws_auth_failed');
+      socket.close(1008, 'unauthorized');
+      return;
+    }
     sessions.attach(device.id, socket);
+    app.log.info({ event: 'device_connected', deviceId: device.id }, 'device_connected');
+    socket.on('close', (code: number) => app.log.info({ event: 'device_disconnected', deviceId: device.id, code }, 'device_disconnected'));
     socket.on('message', data => {
       try {
         const json = JSON.parse(data.toString());
@@ -182,6 +203,8 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
           const payload = ackSchema.parse(envelope.payload);
           if (!storage.acknowledge(device.id, payload.messageId)) {
             sessions.sendTransient(device.id, 'error', { code: 'MESSAGE_NOT_FOUND', message: 'Unknown message ID for this device.', messageId: payload.messageId });
+          } else {
+            app.log.info({ event: 'message_acknowledged', deviceId: device.id, messageId: payload.messageId, transport: 'websocket' }, 'message_acknowledged');
           }
         } else if (envelope.type === 'device.status') {
           const payload = deviceStatusSchema.parse(envelope.payload);
@@ -191,26 +214,44 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
           sessions.sendTransient(device.id, 'pong', { clientMessageId: envelope.id });
         }
       } catch {
+        app.log.warn({ event: 'device_protocol_error', deviceId: device.id }, 'device_protocol_error');
         sessions.sendTransient(device.id, 'error', { code: 'PROTOCOL_ERROR', message: 'Invalid WebSocket message.' });
       }
     });
   });
 
   app.all('/mcp', async (request, reply) => {
-    if (config.NODE_ENV === 'production' && request.hostname !== expectedPublicHost) return reply.code(403).send({ error: 'invalid_host' });
+    if (config.NODE_ENV === 'production' && request.hostname !== expectedPublicHost) {
+      app.log.warn({ event: 'mcp_host_rejected', host: request.hostname }, 'mcp_host_rejected');
+      return reply.code(403).send({ error: 'invalid_host' });
+    }
     const origin = request.headers.origin;
     if (origin) {
       try {
-        if (new URL(origin).hostname !== expectedPublicHost) return reply.code(403).send({ error: 'invalid_origin' });
+        if (new URL(origin).hostname !== expectedPublicHost) {
+          app.log.warn({ event: 'mcp_origin_rejected' }, 'mcp_origin_rejected');
+          return reply.code(403).send({ error: 'invalid_origin' });
+        }
       } catch {
+        app.log.warn({ event: 'mcp_origin_rejected' }, 'mcp_origin_rejected');
         return reply.code(403).send({ error: 'invalid_origin' });
       }
     }
     const token = bearer(request.headers.authorization);
-    if (!token || !constantTimeEqual(token, config.MCP_SHARED_SECRET)) return reply.code(401).send({ error: 'unauthorized' });
+    if (!token || !constantTimeEqual(token, config.MCP_SHARED_SECRET)) {
+      app.log.warn({ event: 'mcp_auth_failed', ip: request.ip }, 'mcp_auth_failed');
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
     const pokeUserId = request.headers['x-poke-user-id'];
-    if (allowlist.size > 0 && (typeof pokeUserId !== 'string' || !allowlist.has(pokeUserId))) return reply.code(403).send({ error: 'poke_user_not_allowed' });
-    if (!limiter.allow(`mcp:${typeof pokeUserId === 'string' ? pokeUserId : 'unknown'}`, 120, 60_000)) return reply.code(429).send({ error: 'rate_limited' });
+    if (allowlist.size > 0 && (typeof pokeUserId !== 'string' || !allowlist.has(pokeUserId))) {
+      app.log.warn({ event: 'mcp_user_rejected', pokeUserId: typeof pokeUserId === 'string' ? pokeUserId : undefined }, 'mcp_user_rejected');
+      return reply.code(403).send({ error: 'poke_user_not_allowed' });
+    }
+    if (!limiter.allow(`mcp:${typeof pokeUserId === 'string' ? pokeUserId : 'unknown'}`, 120, 60_000)) {
+      app.log.warn({ event: 'mcp_rate_limited', pokeUserId: typeof pokeUserId === 'string' ? pokeUserId : undefined }, 'mcp_rate_limited');
+      return reply.code(429).send({ error: 'rate_limited' });
+    }
+    app.log.info({ event: 'mcp_request', pokeUserId: typeof pokeUserId === 'string' ? pokeUserId : undefined, method: mcpMethod(request.body) }, 'mcp_request');
     reply.hijack();
     await mcpNode(request.raw, reply.raw, request.body);
   });
