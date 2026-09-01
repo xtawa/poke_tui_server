@@ -29,6 +29,13 @@ type Envelope = {
   payload?: Record<string, unknown>;
 };
 
+type Waiter = {
+  predicate: (message: Envelope) => boolean;
+  resolve: (message: Envelope) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+};
+
 function authHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
@@ -46,49 +53,81 @@ async function expectJson(url: string, expectedStatus = 200, init?: RequestInit)
   return body;
 }
 
-async function waitForMessage(
-  ws: WebSocket,
-  predicate: (message: Envelope) => boolean,
-  timeout: number
-): Promise<Envelope> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`timeout after ${timeout}ms waiting for WebSocket message`));
-    }, timeout);
-    const onMessage = (raw: RawData) => {
-      let message: Envelope;
-      try {
-        message = JSON.parse(raw.toString()) as Envelope;
-      } catch {
-        return;
-      }
-      if (message.type === 'error') {
-        cleanup();
-        reject(new Error(`bridge returned error: ${JSON.stringify(message.payload ?? {})}`));
-        return;
-      }
-      if (predicate(message)) {
-        cleanup();
-        resolve(message);
-      }
-    };
-    const onClose = (code: number, reason: Buffer) => {
-      cleanup();
-      reject(new Error(`WebSocket closed before expected message: ${code} ${reason.toString()}`));
-    };
-    const cleanup = () => {
-      clearTimeout(timer);
-      ws.off('message', onMessage);
-      ws.off('close', onClose);
-    };
-    ws.on('message', onMessage);
-    ws.on('close', onClose);
-  });
+class WebSocketInbox {
+  private readonly queue: Envelope[] = [];
+  private readonly waiters: Waiter[] = [];
+  private closed: Error | null = null;
+
+  constructor(private readonly ws: WebSocket) {
+    ws.on('message', this.onMessage);
+    ws.on('close', this.onClose);
+  }
+
+  waitFor(predicate: (message: Envelope) => boolean, timeout: number): Promise<Envelope> {
+    if (this.closed) return Promise.reject(this.closed);
+    const index = this.queue.findIndex(predicate);
+    if (index >= 0) return Promise.resolve(this.queue.splice(index, 1)[0]);
+
+    return new Promise((resolve, reject) => {
+      const waiter: Waiter = {
+        predicate,
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const waiterIndex = this.waiters.indexOf(waiter);
+          if (waiterIndex >= 0) this.waiters.splice(waiterIndex, 1);
+          reject(new Error(`timeout after ${timeout}ms waiting for WebSocket message`));
+        }, timeout)
+      };
+      this.waiters.push(waiter);
+    });
+  }
+
+  dispose(): void {
+    this.ws.off('message', this.onMessage);
+    this.ws.off('close', this.onClose);
+    this.failAll(new Error('WebSocket inbox disposed'));
+  }
+
+  private readonly onMessage = (raw: RawData): void => {
+    let message: Envelope;
+    try {
+      message = JSON.parse(raw.toString()) as Envelope;
+    } catch {
+      return;
+    }
+
+    if (message.type === 'error') {
+      this.failAll(new Error(`bridge returned error: ${JSON.stringify(message.payload ?? {})}`));
+      return;
+    }
+
+    const waiterIndex = this.waiters.findIndex(waiter => waiter.predicate(message));
+    if (waiterIndex >= 0) {
+      const waiter = this.waiters.splice(waiterIndex, 1)[0];
+      clearTimeout(waiter.timer);
+      waiter.resolve(message);
+      return;
+    }
+    this.queue.push(message);
+  };
+
+  private readonly onClose = (code: number, reason: Buffer): void => {
+    this.closed = new Error(`WebSocket closed before test completed: ${code} ${reason.toString()}`);
+    this.failAll(this.closed);
+  };
+
+  private failAll(error: Error): void {
+    for (const waiter of this.waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+  }
 }
 
-async function openWebSocket(url: string, token: string): Promise<WebSocket> {
+async function openWebSocket(url: string, token: string): Promise<{ ws: WebSocket; inbox: WebSocketInbox }> {
   const ws = new WebSocket(url, { headers: authHeaders(token) });
+  const inbox = new WebSocketInbox(ws);
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('timeout opening WebSocket')), 15_000);
     ws.once('open', () => {
@@ -100,12 +139,13 @@ async function openWebSocket(url: string, token: string): Promise<WebSocket> {
       reject(error);
     });
   });
-  return ws;
+  return { ws, inbox };
 }
 
 async function run(): Promise<void> {
   let enrollment: Enrollment | null = null;
   let ws: WebSocket | null = null;
+  let inbox: WebSocketInbox | null = null;
   let revoked = false;
   const startedAt = Date.now();
 
@@ -131,28 +171,25 @@ async function run(): Promise<void> {
     if (deviceInfo?.id !== enrollment.deviceId) throw new Error('device auth returned wrong device');
     console.log('PASS device auth');
 
-    ws = await openWebSocket(enrollment.websocketUrl, enrollment.deviceToken);
-    const helloPromise = waitForMessage(ws, message => message.type === 'hello', 10_000);
-    const hello = await helloPromise;
+    ({ ws, inbox } = await openWebSocket(enrollment.websocketUrl, enrollment.deviceToken));
+    const hello = await inbox.waitFor(message => message.type === 'hello', 10_000);
     if (hello.payload?.deviceId !== enrollment.deviceId) throw new Error('hello deviceId mismatch');
     console.log('PASS WebSocket hello');
 
     const clientMessageId = `e2e_${randomUUID()}`;
     const prompt = `Reply with exactly: ${expectedText}`;
-    const acceptedPromise = waitForMessage(ws, message => message.type === 'chat.accepted', 30_000);
     ws.send(JSON.stringify({
       id: clientMessageId,
       type: 'chat.send',
       timestamp: Date.now(),
       payload: { text: prompt }
     }));
-    const accepted = await acceptedPromise;
+    const accepted = await inbox.waitFor(message => message.type === 'chat.accepted', 30_000);
     const requestId = String(accepted.payload?.requestId ?? '');
     if (!requestId.startsWith('req_')) throw new Error(`invalid requestId: ${requestId}`);
     console.log(`PASS Poke API accepted (${requestId})`);
 
-    const reply = await waitForMessage(
-      ws,
+    const reply = await inbox.waitFor(
       message => message.type === 'chat.message' && String(message.payload?.requestId ?? '') === requestId,
       timeoutMs
     );
@@ -181,6 +218,8 @@ async function run(): Promise<void> {
     if (!acknowledged) throw new Error('reply remained pending after ACK');
     console.log('PASS ACK persisted / pending queue cleared');
 
+    inbox.dispose();
+    inbox = null;
     ws.close(1000, 'real e2e complete');
     ws = null;
 
@@ -197,6 +236,7 @@ async function run(): Promise<void> {
 
     console.log(`REAL POKE E2E PASS in ${Date.now() - startedAt}ms`);
   } finally {
+    inbox?.dispose();
     if (ws) {
       try { ws.close(1000, 'cleanup'); } catch { /* ignore */ }
     }
