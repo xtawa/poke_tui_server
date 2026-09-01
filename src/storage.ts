@@ -136,6 +136,7 @@ export class Storage {
   markRequestCompleted(id: string): void { this.db.prepare("UPDATE requests SET status='completed', completed_at=? WHERE id=?").run(Date.now(), id); }
   markRequestError(id: string, error: string): void { this.db.prepare("UPDATE requests SET status='error', error=? WHERE id=?").run(error.slice(0, 1000), id); }
   expireAcceptedRequest(id: string): boolean {
+    if (!this.db.open) return false;
     const result = this.db.prepare("UPDATE requests SET status='reply_timeout', error='Poke reply timeout' WHERE id=? AND status='accepted'").run(id);
     return result.changes > 0;
   }

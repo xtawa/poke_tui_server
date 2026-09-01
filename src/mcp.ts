@@ -10,7 +10,19 @@ const actionSchema = z.object({
   value: z.string().max(1024).optional()
 });
 
-export function createMcpNodeHandler(storage: Storage, sessions: SessionManager) {
+export type McpBridgeEvent = {
+  event: string;
+  deviceId?: string;
+  requestId?: string;
+  messageId?: string;
+  delivered?: boolean;
+  reason?: string;
+};
+
+type EventSink = (event: McpBridgeEvent) => void;
+const noopEventSink: EventSink = () => undefined;
+
+export function createMcpNodeHandler(storage: Storage, sessions: SessionManager, onEvent: EventSink = noopEventSink) {
   const handler = createMcpHandler(() => {
     const server = new McpServer({ name: 'poke-device-bridge', version: '0.1.0' });
 
@@ -25,16 +37,24 @@ export function createMcpNodeHandler(storage: Storage, sessions: SessionManager)
       })
     }, async ({ deviceId, requestId, text, title, actions }) => {
       const device = storage.getDevice(deviceId);
-      if (!device || device.revokedAt) return { content: [{ type: 'text', text: 'Unknown or revoked device.' }], isError: true };
-      if (!storage.requestBelongsTo(requestId, deviceId)) return { content: [{ type: 'text', text: 'requestId does not belong to deviceId.' }], isError: true };
+      if (!device || device.revokedAt) {
+        onEvent({ event: 'poke_reply_rejected', deviceId, requestId, reason: 'unknown_or_revoked_device' });
+        return { content: [{ type: 'text', text: 'Unknown or revoked device.' }], isError: true };
+      }
+      if (!storage.requestBelongsTo(requestId, deviceId)) {
+        onEvent({ event: 'poke_reply_rejected', deviceId, requestId, reason: 'request_device_mismatch' });
+        return { content: [{ type: 'text', text: 'requestId does not belong to deviceId.' }], isError: true };
+      }
       try {
         const outbound = storage.queueOutbound(deviceId, requestId, 'chat.message', { requestId, text, title: title ?? null, actions: actions ?? [] });
         storage.markRequestCompleted(requestId);
         const delivered = sessions.deliver(outbound);
+        onEvent({ event: 'poke_reply_received', deviceId, requestId, messageId: outbound.id, delivered });
+        onEvent({ event: delivered ? 'device_message_delivered' : 'device_message_queued', deviceId, requestId, messageId: outbound.id, delivered });
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, messageId: outbound.id, delivered, queued: !delivered }) }] };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'queue_error';
-        return { content: [{ type: 'text', text: `Could not queue device reply: ${message}` }], isError: true };
+      } catch {
+        onEvent({ event: 'poke_reply_queue_failed', deviceId, requestId });
+        return { content: [{ type: 'text', text: 'Could not queue device reply.' }], isError: true };
       }
     });
 
@@ -48,14 +68,18 @@ export function createMcpNodeHandler(storage: Storage, sessions: SessionManager)
       })
     }, async ({ deviceId, title, body, priority }) => {
       const device = storage.getDevice(deviceId);
-      if (!device || device.revokedAt) return { content: [{ type: 'text', text: 'Unknown or revoked device.' }], isError: true };
+      if (!device || device.revokedAt) {
+        onEvent({ event: 'notification_rejected', deviceId, reason: 'unknown_or_revoked_device' });
+        return { content: [{ type: 'text', text: 'Unknown or revoked device.' }], isError: true };
+      }
       try {
         const outbound = storage.queueOutbound(deviceId, null, 'notification', { title, body, priority });
         const delivered = sessions.deliver(outbound);
+        onEvent({ event: delivered ? 'device_message_delivered' : 'device_message_queued', deviceId, messageId: outbound.id, delivered });
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, messageId: outbound.id, delivered, queued: !delivered }) }] };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'queue_error';
-        return { content: [{ type: 'text', text: `Could not queue notification: ${message}` }], isError: true };
+      } catch {
+        onEvent({ event: 'notification_queue_failed', deviceId });
+        return { content: [{ type: 'text', text: 'Could not queue notification.' }], isError: true };
       }
     });
 

@@ -75,14 +75,14 @@ export class SessionManager {
 
   deliver(outbound: OutboundMessage): boolean {
     const session = this.sessions.get(outbound.deviceId);
-    if (!session || session.socket.readyState !== WebSocket.OPEN) return false;
+    if (!session) return false;
     const envelope: ServerEnvelope = {
       id: outbound.id,
       type: outbound.type as ServerEnvelope['type'],
       timestamp: outbound.createdAt,
       payload: JSON.parse(outbound.payload)
     };
-    this.sendEnvelope(session.socket, envelope);
+    if (!this.sendEnvelope(session.socket, envelope)) return false;
     this.storage.markSent(outbound.id);
     return true;
   }
@@ -93,12 +93,17 @@ export class SessionManager {
 
   sendTransient(deviceId: string, type: ServerEnvelope['type'], payload: unknown): boolean {
     const session = this.sessions.get(deviceId);
-    if (!session || session.socket.readyState !== WebSocket.OPEN) return false;
-    this.sendEnvelope(session.socket, { id: ids.message(), type, timestamp: Date.now(), payload });
-    return true;
+    if (!session) return false;
+    return this.sendEnvelope(session.socket, { id: ids.message(), type, timestamp: Date.now(), payload });
   }
 
-  private sendEnvelope(socket: WebSocket, envelope: ServerEnvelope): void {
-    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(envelope));
+  private sendEnvelope(socket: WebSocket, envelope: ServerEnvelope): boolean {
+    if (socket.readyState !== WebSocket.OPEN) return false;
+    try {
+      socket.send(JSON.stringify(envelope));
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
