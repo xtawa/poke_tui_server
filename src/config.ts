@@ -18,7 +18,8 @@ const envSchema = z.object({
   DEVICE_OFFLINE_QUEUE_LIMIT: z.coerce.number().int().min(10).max(10000).default(100),
   POKE_USER_ID_ALLOWLIST: z.string().default(''),
   STORE_MESSAGE_CONTENT: boolString,
-  TRUST_PROXY: z.string().default('true').transform(v => v === 'true')
+  TRUST_PROXY: z.string().default('true').transform(v => v === 'true'),
+  ALLOW_WS_QUERY_TOKEN: boolString
 });
 
 export type Config = z.infer<typeof envSchema>;
