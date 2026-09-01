@@ -1,4 +1,4 @@
-import WebSocket from 'ws';
+import WebSocket, { type RawData } from 'ws';
 import { randomUUID } from 'node:crypto';
 
 const serverUrl = process.env.SERVER_URL?.replace(/\/$/, '');
@@ -56,7 +56,7 @@ async function waitForMessage(
       cleanup();
       reject(new Error(`timeout after ${timeout}ms waiting for WebSocket message`));
     }, timeout);
-    const onMessage = (raw: WebSocket.RawData) => {
+    const onMessage = (raw: RawData) => {
       let message: Envelope;
       try {
         message = JSON.parse(raw.toString()) as Envelope;
