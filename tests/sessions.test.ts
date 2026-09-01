@@ -32,7 +32,7 @@ function createDeps() {
 }
 
 class FakeSocket extends EventEmitter {
-  readyState = WebSocket.OPEN;
+  readyState: number = WebSocket.OPEN;
   shouldThrow = false;
   sent: string[] = [];
 
