@@ -22,7 +22,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
     logger: { level: config.LOG_LEVEL, redact: ['req.headers.authorization'] },
     trustProxy: config.TRUST_PROXY,
     bodyLimit: 128 * 1024,
-    // Query-token WebSocket auth exists only for old Android clients. Avoid logging URLs containing it.
+    // Query-token WebSocket auth is opt-in for legacy Android clients. Avoid logging URLs containing it.
     disableRequestLogging: true
   });
   await app.register(websocket, { options: { perMessageDeflate: false, maxPayload: 64 * 1024 } });
@@ -153,7 +153,7 @@ export async function buildServer(deps: { config: Config; storage: Storage; poke
   app.get('/ws', { websocket: true }, (socket: WebSocket, request) => {
     const query = request.query as { token?: unknown };
     const headerToken = bearer(request.headers.authorization);
-    const queryToken = typeof query.token === 'string' && query.token.length <= 256 ? query.token : null;
+    const queryToken = config.ALLOW_WS_QUERY_TOKEN && typeof query.token === 'string' && query.token.length <= 256 ? query.token : null;
     const token = headerToken ?? queryToken;
     const device = token ? storage.authenticateDevice(token) : null;
     if (!device) { socket.close(1008, 'unauthorized'); return; }
